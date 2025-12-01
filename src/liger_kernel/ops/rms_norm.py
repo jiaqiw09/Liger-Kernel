@@ -111,6 +111,71 @@ def _rms_norm_forward_kernel(
 
 
 @triton.jit
+def _rms_norm_backward_kernel_simple(
+    dY_ptr,
+    dY_row_stride,
+    dX_ptr,
+    dX_row_stride,
+    X_ptr,
+    X_row_stride,
+    X_dtype: tl.constexpr,
+    W_ptr,
+    W_row_stride,
+    RSTD_ptr,
+    RSTD_row_stride,
+    dW_ptr,
+    dW_row_stride,
+    n_cols,
+    offset,
+    casting_mode: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    NPU-compatible simplified backward kernel: each program handles exactly one row.
+    No pointer increment loops, avoiding NPU compiler limitations.
+    
+    dx = (1 / RMS) * [dy * (w + offset - (1 / N) * (1 / RMS^2) * ((dy * (w + offset)) dot x) * x]
+    dw = sum(dy * (x / RMS)). summation over BxT dimension
+    """
+    row_idx = tl.program_id(0).to(tl.int64)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < n_cols
+
+    # Calculate pointers for this specific row (no increment operations)
+    dY_row = tl.load(dY_ptr + row_idx * dY_row_stride + col_offsets, mask=mask, other=0.0)
+    X_row = tl.load(X_ptr + row_idx * X_row_stride + col_offsets, mask=mask, other=0.0)
+    W_row = tl.load(W_ptr + col_offsets, mask=mask, other=0.0)
+    rstd_row = tl.load(RSTD_ptr + row_idx * RSTD_row_stride)
+
+    W_row = W_row + offset
+    X_row = X_row.to(tl.float32)
+
+    # Different backward graphs for different casting modes
+    if casting_mode == _CASTING_MODE_LLAMA:
+        m = (dY_row * W_row).to(tl.float32)
+    elif casting_mode == _CASTING_MODE_GEMMA:
+        dY_row = dY_row.to(tl.float32)
+        m = dY_row * W_row
+    else:
+        m = dY_row * W_row
+
+    dX_row = rstd_row * m
+    dX_row += (rstd_row) * (-(1 / n_cols) * rstd_row * rstd_row * tl.sum(m * X_row, axis=0) * X_row)
+
+    # Store dX for this row
+    tl.store(dX_ptr + row_idx * dX_row_stride + col_offsets, dX_row.to(X_dtype), mask=mask)
+
+    # Calculate and accumulate gradient of W using atomic operations
+    if casting_mode == _CASTING_MODE_LLAMA:
+        dW_contribution = dY_row * (X_row * rstd_row).to(X_dtype)
+    else:
+        dW_contribution = dY_row * (X_row * rstd_row)
+
+    # Use atomic add to accumulate dW across all rows
+    tl.atomic_add(dW_ptr + col_offsets, dW_contribution.to(tl.float32), mask=mask)
+
+
+@triton.jit
 def _rms_norm_backward_kernel(
     dY_ptr,
     dY_row_stride,
@@ -396,7 +461,11 @@ def rms_norm_forward(X, W, eps, offset, casting_mode, row_mode):
     kernel_args = {}
     if X.device.type == "xpu":
         kernel_args["grf_mode"] = "large"
-    if BLOCK_SIZE > 256 or n_rows < 4096 * 8 or row_mode:
+    
+    # NPU requires simple mode (no block processing)
+    use_simple_kernel = BLOCK_SIZE > 256 or n_rows < 4096 * 8 or row_mode or X.device.type == "npu"
+    
+    if use_simple_kernel:
         _rms_norm_forward_kernel[(n_rows,)](
             Y,
             Y.stride(0),
@@ -444,6 +513,44 @@ def rms_norm_backward(dY, X, W, RSTD, offset, casting_mode, BLOCK_SIZE, num_warp
     dY = dY.view(-1, dim)
     n_rows, n_cols = dY.shape
 
+    if n_cols > BLOCK_SIZE:
+        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+
+    if in_place is True:
+        dX = dY
+    else:
+        dX = torch.zeros_like(dY)
+
+    # NPU uses simplified kernel to avoid pointer increment loops
+    if X.device.type == "npu":
+        # Use simplified kernel: one program per row, atomic operations for dW
+        dW = torch.zeros(n_cols, dtype=torch.float32, device=W.device)
+        grid = (n_rows,)
+        
+        _rms_norm_backward_kernel_simple[grid](
+            dY,
+            dY.stride(0),
+            dX,
+            dX.stride(0),
+            X,
+            X.stride(0),
+            torch_to_triton_dtype[X.dtype],
+            W,
+            W.stride(0),
+            RSTD,
+            RSTD.stride(0),
+            dW,
+            dW.stride(0),
+            n_cols,
+            offset,
+            casting_mode,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+        )
+        dX = dX.view(*shape)
+        return dX, dW.to(W.dtype)
+
+    # Standard path for CUDA/XPU
     sm_count = 1
     if X.device.type == "cuda":
         sm_count = torch.cuda.get_device_properties(X.device).multi_processor_count
@@ -452,16 +559,8 @@ def rms_norm_backward(dY, X, W, RSTD, offset, casting_mode, BLOCK_SIZE, num_warp
 
     # fp32 for numerical stability especially.
     _dW = torch.empty((sm_count, n_cols), dtype=torch.float32, device=W.device)
-
-    if n_cols > BLOCK_SIZE:
-        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
     rows_per_program = math.ceil(n_rows / sm_count)
     grid = (sm_count,)
-
-    if in_place is True:
-        dX = dY
-    else:
-        dX = torch.zeros_like(dY)
 
     # XPU-specific optimization
     kernel_args = {}
