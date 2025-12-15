@@ -13,3 +13,7 @@ To add a new operator:
 
 If __all__ is not defined, all public symbols will be auto-discovered.
 """
+
+from liger_kernel.ops.backends._ascend.ops.swiglu import LigerSiLUMulFunction
+
+__all__ = ["LigerSiLUMulFunction"]
