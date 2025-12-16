@@ -22,13 +22,11 @@ def get_npu_utils():
     """
     try:
         props = driver.active.utils.get_device_properties(0)
-
+        # 有些固件版本可能 key 不一样，多做几个 fallback
         if "num_vectorcore" in props:
             return props["num_vectorcore"]
-
         if "num_aicore" in props:
             return props["num_aicore"]
-
         return SAFE_DEFAULT_CORES
     except Exception:
         return SAFE_DEFAULT_CORES
@@ -36,21 +34,23 @@ def get_npu_utils():
 
 def calculate_settings(n_rows, n_cols):
     """
-    Calculate optimal Grid and Block settings:
-    1. Grid Size = Physical Vector Core count (Maximize parallelism, minimize queuing).
-    2. Block Size = Maximize tiling size within UB limits.
+    Calculate optimal Grid and Block settings.
+    We no longer need 'block_rows_per_core' because we use Grid-Stride Loop.
     """
+    # 1. Calculate Block Size (Tiling on Column dimension)
     target_block = triton.next_power_of_2(n_cols)
     block_size_sub = min(target_block, NPU_MAX_BLOCK_SIZE)
-    block_size_sub = max(block_size_sub, 32)
+    
+    # 【重要】为了配合 tl.parallel(0, 2)，我们需要保证切分后的子块至少为 32 (32*2=64)
+    # 否则切分太小会导致 Bank 冲突或效率下降
+    block_size_sub = max(block_size_sub, 64)
 
+    # 2. Calculate Grid Size (Number of Cores)
     target_grid = get_npu_utils()
-
+    # 如果行数少于核心数，就只启动行数对应的核，避免空转
     grid_size = min(target_grid, n_rows)
 
-    block_rows_per_core = (n_rows + grid_size - 1) // grid_size
-
-    return grid_size, block_rows_per_core, block_size_sub
+    return grid_size, block_size_sub
 
 
 @triton.jit
@@ -66,30 +66,41 @@ def _swiglu_forward_kernel(
     stride,
     n_rows,
     n_cols: tl.constexpr,
-    BLOCK_ROWS_PER_CORE: tl.constexpr,
-    BLOCK_SIZE_SUB: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
+    # 1. 获取当前 Core ID
     pid = tl.program_id(0).to(tl.int64)
-    row_start = pid * BLOCK_ROWS_PER_CORE
+    # 2. 获取总 Core 数量
+    num_progs = tl.num_programs(0)
+    
+    # 3. 预计算并行切分的大小
+    HALF_BLOCK: tl.constexpr = BLOCK_SIZE // 2
 
-    # Iterate over assigned rows.
-    for r in range(BLOCK_ROWS_PER_CORE):
-        curr_row = row_start + r
+    # 4. Grid-Stride Loop: 每个 Core 处理 row_idx, row_idx + num_progs, ...
+    for row_idx in range(pid, n_rows, num_progs):
+        
+        row_offset = row_idx * stride
 
-        row_mask = curr_row < n_rows
-        row_offset = curr_row * stride
+        # Tiling Loop: 处理每一行的所有列
+        for off in range(0, n_cols, BLOCK_SIZE):
+            
+            # 【核心优化】开启双发射并行，绑定到两个 Vector Pipe
+            for s in tl.parallel(0, 2, bind_sub_block=True):
+                # 计算子块的偏移量
+                # s=0: 处理前一半; s=1: 处理后一半
+                current_off = off + s * HALF_BLOCK + tl.arange(0, HALF_BLOCK)
+                
+                mask = current_off < n_cols
+                
+                # Load (注意这里不需要 row_mask，因为外层循环保证了 row_idx < n_rows)
+                a_row = tl.load(a_ptr + row_offset + current_off, mask=mask, other=0.0).to(tl.float32)
+                b_row = tl.load(b_ptr + row_offset + current_off, mask=mask, other=0.0)
 
-        for off in range(0, n_cols, BLOCK_SIZE_SUB):
-            col_offsets = off + tl.arange(0, BLOCK_SIZE_SUB)
+                # Vector Compute
+                c_row = silu(a_row).cast(b_row.dtype) * b_row
 
-            mask = (col_offsets < n_cols) & row_mask
-
-            a_row = tl.load(a_ptr + row_offset + col_offsets, mask=mask, other=0.0).to(tl.float32)
-            b_row = tl.load(b_ptr + row_offset + col_offsets, mask=mask, other=0.0)
-
-            c_row = silu(a_row).cast(b_row.dtype) * b_row
-
-            tl.store(c_ptr + row_offset + col_offsets, c_row, mask=mask)
+                # Store
+                tl.store(c_ptr + row_offset + current_off, c_row, mask=mask)
 
 
 @triton.jit
@@ -102,53 +113,62 @@ def _swiglu_backward_kernel(
     stride,
     n_rows,
     n_cols: tl.constexpr,
-    BLOCK_ROWS_PER_CORE: tl.constexpr,
-    BLOCK_SIZE_SUB: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
-    row_start = pid * BLOCK_ROWS_PER_CORE
+    num_progs = tl.num_programs(0)
+    
+    HALF_BLOCK: tl.constexpr = BLOCK_SIZE // 2
 
-    for r in range(BLOCK_ROWS_PER_CORE):
-        curr_row = row_start + r
+    # Grid-Stride Loop
+    for row_idx in range(pid, n_rows, num_progs):
+        
+        row_offset = row_idx * stride
 
-        # Row validation mask
-        row_mask = curr_row < n_rows
-        row_offset = curr_row * stride
+        for off in range(0, n_cols, BLOCK_SIZE):
+            
+            # 【核心优化】双路并行
+            for s in tl.parallel(0, 2, bind_sub_block=True):
+                current_off = off + s * HALF_BLOCK + tl.arange(0, HALF_BLOCK)
+                
+                mask = current_off < n_cols
 
-        for off in range(0, n_cols, BLOCK_SIZE_SUB):
-            col_offsets = off + tl.arange(0, BLOCK_SIZE_SUB)
+                # Load
+                dc_row = tl.load(dc_ptr + row_offset + current_off, mask=mask, other=0.0)
+                a_row = tl.load(a_ptr + row_offset + current_off, mask=mask, other=0.0).to(tl.float32)
+                b_row = tl.load(b_ptr + row_offset + current_off, mask=mask, other=0.0)
 
-            mask = (col_offsets < n_cols) & row_mask
+                # Recompute Forward & Calculate Gradient
+                # 这一段计算量比 Forward 大，并行化收益更明显
+                sig_a = tl.sigmoid(a_row)
+                silu_a = a_row * sig_a
 
-            dc_row = tl.load(dc_ptr + row_offset + col_offsets, mask=mask, other=0.0)
-            a_row = tl.load(a_ptr + row_offset + col_offsets, mask=mask, other=0.0).to(tl.float32)
-            b_row = tl.load(b_ptr + row_offset + col_offsets, mask=mask, other=0.0)
+                # Gradient Logic
+                # d(SiLU * B) / dA = B * (SiLU' * dA) 
+                # SiLU'(x) = SiLU(x) + sigmoid(x)(1 - SiLU(x)/x) ... 简化为下式
+                term1 = silu_a * (1.0 - sig_a) + sig_a
+                
+                db_row = dc_row * silu_a
+                da_row = dc_row * term1 * b_row
 
-            # Recompute Forward
-            sig_a = tl.sigmoid(a_row)
-            silu_a = a_row * sig_a
-
-            term1 = silu_a * (1.0 - sig_a) + sig_a
-            db_row = dc_row * silu_a
-            da_row = dc_row * term1 * b_row
-
-            tl.store(da_ptr + row_offset + col_offsets, da_row, mask=mask)
-            tl.store(db_ptr + row_offset + col_offsets, db_row, mask=mask)
+                # Store
+                tl.store(da_ptr + row_offset + current_off, da_row, mask=mask)
+                tl.store(db_ptr + row_offset + current_off, db_row, mask=mask)
 
 
 def swiglu_forward(a, b):
     # Use torch.empty() to create a standard contiguous tensor.
-    # Avoiding empty_like() prevents inheriting NPU-internal formats (e.g., NZ).
     c = torch.empty(a.shape, dtype=a.dtype, device=a.device)
 
-    # Flatten input to 2D (N, Hidden) to properly handle 3D tensors (Batch, Seq, Hidden)
+    # Flatten input to 2D (N, Hidden)
     n_cols = a.shape[-1]
     a_flat = a.view(-1, n_cols)
     b_flat = b.view(-1, n_cols)
     c_flat = c.view(-1, n_cols)
     n_rows = a_flat.shape[0]
 
-    grid_size, block_rows, block_size_sub = calculate_settings(n_rows, n_cols)
+    # 不再计算 block_rows_per_core，改用 Grid-Stride 逻辑
+    grid_size, block_size = calculate_settings(n_rows, n_cols)
 
     _swiglu_forward_kernel[(grid_size,)](
         a_flat,
@@ -157,8 +177,7 @@ def swiglu_forward(a, b):
         c_flat.stride(0),
         n_rows,
         n_cols,
-        BLOCK_ROWS_PER_CORE=block_rows,
-        BLOCK_SIZE_SUB=block_size_sub,
+        BLOCK_SIZE=block_size,
     )
     return a, b, c.view(*a.shape)
 
@@ -178,7 +197,7 @@ def swiglu_backward(a, b, dc):
 
     n_rows = dc_flat.shape[0]
 
-    grid_size, block_rows, block_size_sub = calculate_settings(n_rows, n_cols)
+    grid_size, block_size = calculate_settings(n_rows, n_cols)
 
     _swiglu_backward_kernel[(grid_size,)](
         dc_flat,
@@ -189,8 +208,7 @@ def swiglu_backward(a, b, dc):
         dc_flat.stride(0),
         n_rows,
         n_cols,
-        BLOCK_ROWS_PER_CORE=block_rows,
-        BLOCK_SIZE_SUB=block_size_sub,
+        BLOCK_SIZE=block_size,
     )
     return grad_a.view(*a.shape), grad_b.view(*b.shape)
 
