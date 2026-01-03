@@ -23,6 +23,8 @@ from liger_kernel.ops.backends._ascend.ops.qwen2vl_mrope import qwen2vl_mrope_fo
 from liger_kernel.ops.backends._ascend.ops.rope import LigerRopeFunction
 from liger_kernel.ops.backends._ascend.ops.rope import rope_backward
 from liger_kernel.ops.backends._ascend.ops.rope import rope_forward
+from liger_kernel.ops.backends._ascend.ops.swiglu import LigerSiLUMulFunction
+
 
 __all__ = [
     "LigerGELUMulFunction",
@@ -34,4 +36,5 @@ __all__ = [
     "LigerRopeFunction",
     "rope_forward",
     "rope_backward",
+    "LigerSiLUMulFunction"
 ]
