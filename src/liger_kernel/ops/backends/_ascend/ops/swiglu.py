@@ -1,232 +1,311 @@
 """
-UB-aware SwiGLU implementation for Ascend NPU (High Performance).
+High-Performance UB-Aware SwiGLU for Ascend NPU (Standalone).
 
-Strategy:
-1. Enable `num_stages=3` to hide memory latency (crucial for performance).
-2. Dynamically scale the memory multiplier by `num_stages` to reduce the Block Size.
-   This ensures that 3 full tiles fit into the UB, preventing overflow while keeping the pipeline full.
+Optimization Strategy:
+1. Grid Size = Physical Core Count (Vector Cores).
+   - Prevents task scheduling overhead.
+   - Uses Grid-Stride Loop to process data continuously.
+2. Flattened 1D Memory Access.
+   - Ignores rows/cols, treats memory as a single contiguous block.
+   - Maximizes memory bandwidth (coalesced access).
+3. Fixed UB-Safe Block Size + Pipeline.
+   - Uses fixed block size (4096) to fit safely within ~192KB UB.
+   - Uses num_stages=3 to hide HBM latency via prefetching.
 """
 
 import torch
+import torch_npu
 import triton
 import triton.language as tl
+import triton.runtime.driver as driver
 
-from liger_kernel.ops.backends._ascend.ub_manager import compute_default_tiling_strategy
-from liger_kernel.ops.utils import calculate_settings
-from liger_kernel.ops.utils import ensure_contiguous
+# -----------------------------------------------------------------------------
+# Configuration Constants
+# -----------------------------------------------------------------------------
+
+# Unified Buffer (UB) Limits on Ascend:
+# Typically ~192KB on 910B.
+# FP32 (4 bytes) * 4096 elements * 8 tensors (worst case backward) ~= 128KB.
+# This leaves room for system overhead and double buffering.
+UB_SAFE_BLOCK_SIZE = 4096
+
+# Fallback core count if detection fails
+SAFE_DEFAULT_CORES = 20
+
+# -----------------------------------------------------------------------------
+# Hardware Detection Helper
+# -----------------------------------------------------------------------------
+
+def get_npu_core_count():
+    """
+    Detects the number of Vector Cores on the current Ascend device.
+    """
+    try:
+        # Get properties for device 0 (current)
+        props = driver.active.utils.get_device_properties(0)
+        
+        # Priority 1: Vector Cores (Primary compute unit for SwiGLU)
+        if "num_vectorcore" in props:
+            return props["num_vectorcore"]
+        
+        # Priority 2: AI Cores (On some older firmwares)
+        if "num_aicore" in props:
+            return props["num_aicore"]
+            
+        return SAFE_DEFAULT_CORES
+    except Exception:
+        # If Triton driver check fails, try torch_npu (if available in newer versions)
+        return SAFE_DEFAULT_CORES
+
+# -----------------------------------------------------------------------------
+# Triton Kernels (Flattened 1D + Grid-Stride)
+# -----------------------------------------------------------------------------
 
 @triton.jit
-def silu(x):
-    return x * tl.sigmoid(x)
-
-@triton.jit
-def _swiglu_forward_kernel_npu(
+def _swiglu_forward_kernel_flat(
     a_ptr, 
     b_ptr, 
     c_ptr, 
-    stride, 
-    n_cols: tl.constexpr, 
+    total_elements, 
     BLOCK_SIZE: tl.constexpr
 ):
-    """
-    UB-aware SwiGLU forward kernel.
-    """
-    program_id = tl.program_id(0).to(tl.int64)
+    # 1. Thread Identity
+    pid = tl.program_id(0)
+    num_progs = tl.num_programs(0)
+    
+    # 2. Grid-Stride Logic
+    # Each core processes a chunk, then skips ahead by (GridSize * BlockSize)
+    # This acts like a persistent thread consuming the work queue.
+    start_idx = pid * BLOCK_SIZE
+    stride = num_progs * BLOCK_SIZE
 
-    # Offset pointers to the current row
-    a_ptr += program_id * stride
-    b_ptr += program_id * stride
-    c_ptr += program_id * stride
+    for idx in range(start_idx, total_elements, stride):
+        # Offsets for the current block
+        offsets = idx + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < total_elements
 
-    # Process col tiles. 
-    # With num_stages > 1, the compiler handles prefetching automatically.
-    for i in range(0, n_cols, BLOCK_SIZE):
-        col_offsets = i + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < n_cols
+        # Load & Cast to FP32 (Crucial for Ascend performance/precision)
+        a_val = tl.load(a_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        b_val = tl.load(b_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
 
-        # Load inputs.
-        # Crucial: Cast to FP32 immediately. Ascend NPU prefers FP32 for 
-        # transcendental functions (sigmoid) to avoid precision/overflow issues.
-        a_row = tl.load(a_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
-        b_row = tl.load(b_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
+        # Compute: SwiGLU = (a * sigmoid(a)) * b
+        res = (a_val * tl.sigmoid(a_val)) * b_val
 
-        # Compute: (a * sigmoid(a)) * b
-        res = silu(a_row) * b_row
-
-        # Store result
-        tl.store(c_ptr + col_offsets, res, mask=mask)
+        # Store
+        tl.store(c_ptr + offsets, res, mask=mask)
 
 
 @triton.jit
-def _swiglu_backward_kernel_npu_explicit(
+def _swiglu_backward_kernel_flat(
     dc_ptr, 
     a_ptr, 
     b_ptr, 
-    da_ptr, # Explicit output for grad_a
-    db_ptr, # Explicit output for grad_b
-    stride, 
-    n_cols: tl.constexpr, 
+    da_ptr, 
+    db_ptr,
+    total_elements,
     BLOCK_SIZE: tl.constexpr
 ):
-    """
-    UB-aware SwiGLU backward kernel.
-    Uses explicit output buffers to avoid in-place hazards.
-    """
-    program_id = tl.program_id(0).to(tl.int64)
-
-    row_offset = program_id * stride
+    pid = tl.program_id(0)
+    num_progs = tl.num_programs(0)
     
-    for i in range(0, n_cols, BLOCK_SIZE):
-        col_offsets = i + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < n_cols
-        
-        # Calculate pointers
-        curr_dc = dc_ptr + row_offset + col_offsets
-        curr_a  = a_ptr  + row_offset + col_offsets
-        curr_b  = b_ptr  + row_offset + col_offsets
-        curr_da = da_ptr + row_offset + col_offsets
-        curr_db = db_ptr + row_offset + col_offsets
+    start_idx = pid * BLOCK_SIZE
+    stride = num_progs * BLOCK_SIZE
 
-        # Load inputs & cast to FP32
-        dc_val = tl.load(curr_dc, mask=mask, other=0.0).to(tl.float32)
-        a_val  = tl.load(curr_a, mask=mask, other=0.0).to(tl.float32)
-        b_val  = tl.load(curr_b, mask=mask, other=0.0).to(tl.float32)
+    for idx in range(start_idx, total_elements, stride):
+        offsets = idx + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < total_elements
 
-        # Recompute forward activations
-        sig_a = tl.sigmoid(a_val)
-        silu_a = a_val * sig_a
+        # Load inputs (FP32)
+        dc = tl.load(dc_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        a  = tl.load(a_ptr  + offsets, mask=mask, other=0.0).to(tl.float32)
+        b  = tl.load(b_ptr  + offsets, mask=mask, other=0.0).to(tl.float32)
+
+        # Recompute Forward Activation
+        sig_a = tl.sigmoid(a)
+        silu_a = a * sig_a
         
-        # Gradient Math:
-        # d(SiLU)/da = SiLU + Sigmoid * (1 - SiLU/a * a)
-        # Simplified: term1 = silu * (1 - sig) + sig
+        # Gradient Math
+        # d(SiLU)/da = SiLU + Sigmoid * (1 - SiLU/a * a) -> SiLU + Sig * (1 - Sig * a)
+        # Simplified term: silu * (1 - sig) + sig
         term1 = silu_a * (1.0 - sig_a) + sig_a
         
         # db = dc * SiLU(a)
-        db_val = dc_val * silu_a
+        db_res = dc * silu_a
         # da = dc * b * term1
-        da_val = dc_val * term1 * b_val
+        da_res = dc * b * term1
 
-        # Store gradients
-        tl.store(curr_da, da_val, mask=mask)
-        tl.store(curr_db, db_val, mask=mask)
+        # Store Gradients
+        tl.store(da_ptr + offsets, da_res, mask=mask)
+        tl.store(db_ptr + offsets, db_res, mask=mask)
 
+# -----------------------------------------------------------------------------
+# Python Launchers
+# -----------------------------------------------------------------------------
 
 def swiglu_forward(a, b):
-    ori_shape = a.shape
-    n_cols = ori_shape[-1]
+    # Ensure memory is contiguous for 1D flattening
+    if not a.is_contiguous(): a = a.contiguous()
+    if not b.is_contiguous(): b = b.contiguous()
     
-    a = a.view(-1, n_cols)
-    b = b.view(-1, n_cols)
+    total_elements = a.numel()
     c = torch.empty_like(a)
-    n_rows = a.shape[0]
 
-    desired_block_size, num_warps = calculate_settings(n_cols)
-
-    # --- UB Strategy for High Performance ---
-    # We want num_stages=3 for pipelining.
-    # Therefore, the UB must hold 3 tiles simultaneously.
-    # We scale the memory multiplier by 3 to force the Block Size to be ~1/3rd.
+    # Strategy: Use all physical cores
+    num_cores = get_npu_core_count()
     
-    NUM_STAGES = 3
-    # Base estimate for 1 tile (FP32 conversion + overheads)
-    BASE_MEMORY_MULTIPLIER = 8.0 
-    EFFECTIVE_MULTIPLIER = BASE_MEMORY_MULTIPLIER * NUM_STAGES
+    # Calculate Grid Size
+    # If data is small, don't launch more cores than blocks
+    needed_blocks = (total_elements + UB_SAFE_BLOCK_SIZE - 1) // UB_SAFE_BLOCK_SIZE
+    grid_size = min(num_cores, needed_blocks)
 
-    dtype_size = a.element_size()
-    
-    tile_shapes = compute_default_tiling_strategy(
-        safety_margin=0.85, # Slightly higher margin for smaller blocks
-        dtype_size=dtype_size,
-        memory_multiplier=EFFECTIVE_MULTIPLIER,
-        shapes=((n_cols,),),
-        tiling_dims=(0,),
+    _swiglu_forward_kernel_flat[(grid_size,)](
+        a, b, c,
+        total_elements,
+        BLOCK_SIZE=UB_SAFE_BLOCK_SIZE,
+        num_warps=4,   # 4 Warps is standard for vector ops
+        num_stages=3   # Enable Pipeline (Ping-Pong buffering) to hide latency
     )
-
-    if tile_shapes is not None and len(tile_shapes) > 0:
-        adjusted_block_size = tile_shapes[0][0]
-    else:
-        # Fallback: manually divide desired size by stages
-        adjusted_block_size = max(32, desired_block_size // NUM_STAGES)
-
-    _swiglu_forward_kernel_npu[(n_rows,)](
-        a,
-        b,
-        c,
-        c.stride(-2),
-        n_cols=n_cols,
-        BLOCK_SIZE=adjusted_block_size,
-        num_warps=num_warps,
-        num_stages=NUM_STAGES, # Pipelining enabled
-    )
-    return a, b, c.view(*ori_shape)
-
+    return c
 
 def swiglu_backward(a, b, dc):
-    ori_shape = dc.shape
-    n_cols = ori_shape[-1]
-    dc = dc.view(-1, n_cols)
-    n_rows = dc.shape[0]
+    if not dc.is_contiguous(): dc = dc.contiguous()
+    if not a.is_contiguous(): a = a.contiguous()
+    if not b.is_contiguous(): b = b.contiguous()
 
-    desired_block_size, num_warps = calculate_settings(n_cols)
-
-    # --- UB Strategy for Backward ---
-    # Backward requires more memory (3 loads, complex intermediates).
-    # Base multiplier is higher (14.0).
-    
-    NUM_STAGES = 3
-    BASE_MEMORY_MULTIPLIER = 14.0
-    EFFECTIVE_MULTIPLIER = BASE_MEMORY_MULTIPLIER * NUM_STAGES
-
-    dtype_size = dc.element_size()
-    
-    tile_shapes = compute_default_tiling_strategy(
-        safety_margin=0.85,
-        dtype_size=dtype_size,
-        memory_multiplier=EFFECTIVE_MULTIPLIER,
-        shapes=((n_cols,),),
-        tiling_dims=(0,),
-    )
-    
-    if tile_shapes:
-        adjusted_block_size = tile_shapes[0][0]
-    else:
-        adjusted_block_size = max(32, desired_block_size // NUM_STAGES)
-
+    total_elements = dc.numel()
     grad_a = torch.empty_like(a)
     grad_b = torch.empty_like(b)
     
-    a_flat = a.view(-1, n_cols)
-    b_flat = b.view(-1, n_cols)
-    ga_flat = grad_a.view(-1, n_cols)
-    gb_flat = grad_b.view(-1, n_cols)
+    num_cores = get_npu_core_count()
+    needed_blocks = (total_elements + UB_SAFE_BLOCK_SIZE - 1) // UB_SAFE_BLOCK_SIZE
+    grid_size = min(num_cores, needed_blocks)
 
-    _swiglu_backward_kernel_npu_explicit[(n_rows,)](
-        dc,
-        a_flat,
-        b_flat,
-        ga_flat,
-        gb_flat,
-        dc.stride(-2),
-        n_cols=n_cols,
-        BLOCK_SIZE=adjusted_block_size,
-        num_warps=num_warps,
-        num_stages=NUM_STAGES, # Pipelining enabled
+    _swiglu_backward_kernel_flat[(grid_size,)](
+        dc, a, b,
+        grad_a, grad_b,
+        total_elements,
+        BLOCK_SIZE=UB_SAFE_BLOCK_SIZE,
+        num_warps=4,
+        num_stages=3
     )
-    
-    return grad_a.view(*ori_shape), grad_b.view(*ori_shape)
+    return grad_a, grad_b
 
+# -----------------------------------------------------------------------------
+# Autograd Function
+# -----------------------------------------------------------------------------
 
 class LigerSiLUMulFunction(torch.autograd.Function):
     @staticmethod
-    @ensure_contiguous
     def forward(ctx, a, b):
-        a, b, c = swiglu_forward(a, b)
+        c = swiglu_forward(a, b)
         ctx.save_for_backward(a, b)
         return c
 
     @staticmethod
-    @ensure_contiguous
     def backward(ctx, dc):
         a, b = ctx.saved_tensors
         grad_a, grad_b = swiglu_backward(a, b, dc)
         return grad_a, grad_b
+
+def liger_swiglu(a, b):
+    return LigerSiLUMulFunction.apply(a, b)
+
+# -----------------------------------------------------------------------------
+# Benchmark & Verification Main Block
+# -----------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import time
+    
+    # 1. Setup
+    torch.manual_seed(123)
+    device = "npu:0"
+    dtype = torch.float16
+    
+    # Shape Config: Llama 3 70B (SwiGLU specific)
+    # Batch * SeqLen = 32 * 4096 tokens
+    # Hidden Dim = 14336 (Intermediate size for 70B model)
+    B, S, H = 32, 4096, 14336 
+    print(f"--- Benchmark Configuration ---")
+    print(f"Device: {torch.npu.get_device_name(0)}")
+    print(f"Shape: [{B*S}, {H}] (Flattened)")
+    print(f"Dtype: {dtype}")
+    print(f"Cores detected: {get_npu_core_count()}")
+    print("-" * 30)
+
+    # Create Tensors
+    # We use 'view' to simulate the input shape of an MLP layer
+    a = torch.randn((B * S, H), device=device, dtype=dtype, requires_grad=True)
+    b = torch.randn((B * S, H), device=device, dtype=dtype, requires_grad=True)
+    
+    # -------------------------------------------------------------------------
+    # 2. Correctness Check
+    # -------------------------------------------------------------------------
+    print("Running Correctness Check...")
+    
+    # Baseline (Torch Native)
+    import torch.nn.functional as F
+    def torch_swiglu_fn(x, y):
+        return F.silu(x) * y
+
+    target_c = torch_swiglu_fn(a, b)
+    loss_native = target_c.sum()
+    loss_native.backward()
+    grad_a_native = a.grad.clone()
+    grad_b_native = b.grad.clone()
+    
+    # Reset Grads
+    a.grad = None
+    b.grad = None
+    
+    # Triton (Liger)
+    triton_c = liger_swiglu(a, b)
+    loss_triton = triton_c.sum()
+    loss_triton.backward()
+    grad_a_triton = a.grad.clone()
+    grad_b_triton = b.grad.clone()
+
+    # Compare
+    fwd_diff = (target_c - triton_c).abs().max().item()
+    bwd_a_diff = (grad_a_native - grad_a_triton).abs().max().item()
+    bwd_b_diff = (grad_b_native - grad_b_triton).abs().max().item()
+    
+    if fwd_diff < 1e-2 and bwd_a_diff < 1e-2:
+        print(f"✅ Correctness Passed! (Max Diff: {fwd_diff:.6f})")
+    else:
+        print(f"❌ Correctness Failed. Forward Diff: {fwd_diff}, Grad Diff: {bwd_a_diff}")
+        exit()
+
+    # -------------------------------------------------------------------------
+    # 3. Performance Benchmark
+    # -------------------------------------------------------------------------
+    print("\nRunning Performance Benchmark (Warmup: 10, Iter: 100)...")
+
+    # Warmup
+    for _ in range(10):
+        torch_swiglu_fn(a, b)
+        liger_swiglu(a, b)
+    torch.npu.synchronize()
+
+    # Torch Timing
+    start_event = torch.npu.Event(enable_timing=True)
+    end_event = torch.npu.Event(enable_timing=True)
+    
+    start_event.record()
+    for _ in range(100):
+        _ = torch_swiglu_fn(a, b)
+    end_event.record()
+    torch.npu.synchronize()
+    torch_time = start_event.elapsed_time(end_event) / 100.0
+
+    # Triton Timing
+    start_event.record()
+    for _ in range(100):
+        _ = liger_swiglu(a, b)
+    end_event.record()
+    torch.npu.synchronize()
+    triton_time = start_event.elapsed_time(end_event) / 100.0
+
+    print(f"Torch Native: {torch_time:.3f} ms")
+    print(f"Triton Liger: {triton_time:.3f} ms")
+    print(f"Speedup:      {torch_time / triton_time:.2f}x")
