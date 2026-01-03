@@ -1,8 +1,10 @@
 """
-UB-aware SwiGLU implementation for Ascend NPU.
+UB-aware SwiGLU implementation for Ascend NPU (High Performance).
 
-This implementation automatically adjusts block sizes to fit within UB constraints,
-preventing UB overflow errors while maintaining high performance via pipelining.
+Strategy:
+1. Enable `num_stages=3` to hide memory latency (crucial for performance).
+2. Dynamically scale the memory multiplier by `num_stages` to reduce the Block Size.
+   This ensures that 3 full tiles fit into the UB, preventing overflow while keeping the pipeline full.
 """
 
 import torch
@@ -27,27 +29,28 @@ def _swiglu_forward_kernel_npu(
     BLOCK_SIZE: tl.constexpr
 ):
     """
-    UB-aware SwiGLU forward kernel for NPU.
+    UB-aware SwiGLU forward kernel.
     """
     program_id = tl.program_id(0).to(tl.int64)
 
-    # Locate start index for the current row
+    # Offset pointers to the current row
     a_ptr += program_id * stride
     b_ptr += program_id * stride
     c_ptr += program_id * stride
 
-    # Process in tiles to ensure we fit in UB.
-    # Because num_stages > 1, the compiler will prefetch future blocks
-    # into the UB automatically.
+    # Process col tiles. 
+    # With num_stages > 1, the compiler handles prefetching automatically.
     for i in range(0, n_cols, BLOCK_SIZE):
         col_offsets = i + tl.arange(0, BLOCK_SIZE)
         mask = col_offsets < n_cols
 
-        # Load input (FP16/BF16 -> FP32 for compute accuracy and stability on NPU)
+        # Load inputs.
+        # Crucial: Cast to FP32 immediately. Ascend NPU prefers FP32 for 
+        # transcendental functions (sigmoid) to avoid precision/overflow issues.
         a_row = tl.load(a_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
         b_row = tl.load(b_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
 
-        # Compute SwiGLU: (a * sigmoid(a)) * b
+        # Compute: (a * sigmoid(a)) * b
         res = silu(a_row) * b_row
 
         # Store result
@@ -59,14 +62,15 @@ def _swiglu_backward_kernel_npu_explicit(
     dc_ptr, 
     a_ptr, 
     b_ptr, 
-    da_ptr, # Output buffer for grad_a
-    db_ptr, # Output buffer for grad_b
+    da_ptr, # Explicit output for grad_a
+    db_ptr, # Explicit output for grad_b
     stride, 
     n_cols: tl.constexpr, 
     BLOCK_SIZE: tl.constexpr
 ):
     """
-    UB-aware SwiGLU backward kernel for NPU with explicit output buffers.
+    UB-aware SwiGLU backward kernel.
+    Uses explicit output buffers to avoid in-place hazards.
     """
     program_id = tl.program_id(0).to(tl.int64)
 
@@ -83,23 +87,23 @@ def _swiglu_backward_kernel_npu_explicit(
         curr_da = da_ptr + row_offset + col_offsets
         curr_db = db_ptr + row_offset + col_offsets
 
-        # Load inputs and cast to FP32 for precision
+        # Load inputs & cast to FP32
         dc_val = tl.load(curr_dc, mask=mask, other=0.0).to(tl.float32)
         a_val  = tl.load(curr_a, mask=mask, other=0.0).to(tl.float32)
         b_val  = tl.load(curr_b, mask=mask, other=0.0).to(tl.float32)
 
-        # Recomputation of forward activations
+        # Recompute forward activations
         sig_a = tl.sigmoid(a_val)
         silu_a = a_val * sig_a
         
-        # SwiGLU Gradient Math:
-        # term1 = d(SiLU)/da = silu + sigmoid * (1 - silu/a * a)
-        # Simplified to: silu_a * (1.0 - sig_a) + sig_a
+        # Gradient Math:
+        # d(SiLU)/da = SiLU + Sigmoid * (1 - SiLU/a * a)
+        # Simplified: term1 = silu * (1 - sig) + sig
         term1 = silu_a * (1.0 - sig_a) + sig_a
         
         # db = dc * SiLU(a)
         db_val = dc_val * silu_a
-        # da = dc * b * d(SiLU)/da
+        # da = dc * b * term1
         da_val = dc_val * term1 * b_val
 
         # Store gradients
@@ -111,7 +115,6 @@ def swiglu_forward(a, b):
     ori_shape = a.shape
     n_cols = ori_shape[-1]
     
-    # Flatten logic
     a = a.view(-1, n_cols)
     b = b.view(-1, n_cols)
     c = torch.empty_like(a)
@@ -119,38 +122,30 @@ def swiglu_forward(a, b):
 
     desired_block_size, num_warps = calculate_settings(n_cols)
 
-    # ========================================================
-    # Performance Optimization Strategy:
-    # 1. Enable pipelining (NUM_STAGES = 3) to hide memory latency.
-    # 2. To prevent UB Overflow, we must scale the memory multiplier.
-    #    Since 3 stages mean 3 tiles reside in UB simultaneously,
-    #    the memory pressure is 3x per element.
-    # ========================================================
+    # --- UB Strategy for High Performance ---
+    # We want num_stages=3 for pipelining.
+    # Therefore, the UB must hold 3 tiles simultaneously.
+    # We scale the memory multiplier by 3 to force the Block Size to be ~1/3rd.
+    
     NUM_STAGES = 3
-    
-    # Base multiplier for a single tile (FP32 conversion + intermediates)
-    # 2 inputs + 1 output + FP32 overhead ~= 8x input size (conservative)
+    # Base estimate for 1 tile (FP32 conversion + overheads)
     BASE_MEMORY_MULTIPLIER = 8.0 
-    
-    # Effective multiplier forces the tiling algorithm to pick a smaller BLOCK_SIZE
-    # that accommodates 3 stages.
-    EFFECTIVE_MULTIPLIER = BASE_MEMORY_MULTIPLIER * NUM_STAGES 
+    EFFECTIVE_MULTIPLIER = BASE_MEMORY_MULTIPLIER * NUM_STAGES
 
-    dtype_size = a.element_size() # e.g., 2 bytes for BF16
+    dtype_size = a.element_size()
     
-    shapes = ((n_cols,),)
     tile_shapes = compute_default_tiling_strategy(
-        safety_margin=0.85, 
+        safety_margin=0.85, # Slightly higher margin for smaller blocks
         dtype_size=dtype_size,
-        memory_multiplier=EFFECTIVE_MULTIPLIER, 
-        shapes=shapes,
+        memory_multiplier=EFFECTIVE_MULTIPLIER,
+        shapes=((n_cols,),),
         tiling_dims=(0,),
     )
 
     if tile_shapes is not None and len(tile_shapes) > 0:
         adjusted_block_size = tile_shapes[0][0]
     else:
-        # Fallback: manually reduce block size to fit stages
+        # Fallback: manually divide desired size by stages
         adjusted_block_size = max(32, desired_block_size // NUM_STAGES)
 
     _swiglu_forward_kernel_npu[(n_rows,)](
@@ -161,7 +156,7 @@ def swiglu_forward(a, b):
         n_cols=n_cols,
         BLOCK_SIZE=adjusted_block_size,
         num_warps=num_warps,
-        num_stages=NUM_STAGES, 
+        num_stages=NUM_STAGES, # Pipelining enabled
     )
     return a, b, c.view(*ori_shape)
 
@@ -174,13 +169,12 @@ def swiglu_backward(a, b, dc):
 
     desired_block_size, num_warps = calculate_settings(n_cols)
 
-    # ========================================================
-    # Backward Strategy:
-    # Requires significantly more memory (3 loads, 2 stores, complex FP32 math).
-    # We increase the base multiplier to 14.0.
-    # ========================================================
+    # --- UB Strategy for Backward ---
+    # Backward requires more memory (3 loads, complex intermediates).
+    # Base multiplier is higher (14.0).
+    
     NUM_STAGES = 3
-    BASE_MEMORY_MULTIPLIER = 14.0 
+    BASE_MEMORY_MULTIPLIER = 14.0
     EFFECTIVE_MULTIPLIER = BASE_MEMORY_MULTIPLIER * NUM_STAGES
 
     dtype_size = dc.element_size()
@@ -196,14 +190,11 @@ def swiglu_backward(a, b, dc):
     if tile_shapes:
         adjusted_block_size = tile_shapes[0][0]
     else:
-        # Fallback safety
         adjusted_block_size = max(32, desired_block_size // NUM_STAGES)
 
-    # Allocate gradients
-    grad_a = torch.empty_like(a) 
+    grad_a = torch.empty_like(a)
     grad_b = torch.empty_like(b)
     
-    # Flatten views
     a_flat = a.view(-1, n_cols)
     b_flat = b.view(-1, n_cols)
     ga_flat = grad_a.view(-1, n_cols)
@@ -219,7 +210,7 @@ def swiglu_backward(a, b, dc):
         n_cols=n_cols,
         BLOCK_SIZE=adjusted_block_size,
         num_warps=num_warps,
-        num_stages=NUM_STAGES,
+        num_stages=NUM_STAGES, # Pipelining enabled
     )
     
     return grad_a.view(*ori_shape), grad_b.view(*ori_shape)
@@ -229,7 +220,6 @@ class LigerSiLUMulFunction(torch.autograd.Function):
     @staticmethod
     @ensure_contiguous
     def forward(ctx, a, b):
-        # Forward pass: compute and save tensors for backward
         a, b, c = swiglu_forward(a, b)
         ctx.save_for_backward(a, b)
         return c
@@ -237,7 +227,6 @@ class LigerSiLUMulFunction(torch.autograd.Function):
     @staticmethod
     @ensure_contiguous
     def backward(ctx, dc):
-        # Backward pass: compute gradients
         a, b = ctx.saved_tensors
         grad_a, grad_b = swiglu_backward(a, b, dc)
         return grad_a, grad_b
