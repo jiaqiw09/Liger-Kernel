@@ -107,7 +107,7 @@ def swiglu_forward(a, b):
     _swiglu_forward_kernel_flat[(grid_size,)](
         a, b, c, total_elements, 
         BLOCK_SIZE=block_size, 
-        num_stages=3,
+        NUM_STAGES=3,
         num_warps=4
     )
     return c
